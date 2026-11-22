@@ -33,7 +33,7 @@ end
 ---@return string search_term
 local function in_frontmatter_tags_list(bufnr, cursor_line, cursor_before_line)
   -- Check if current line looks like a YAML list item: "  - something" or "  - "
-  local item_text = cursor_before_line:match "^%s+-%s+(.*)" or cursor_before_line:match "^%s+-%s*$" and ""
+  local item_text = cursor_before_line:match "^%s*-%s+(.*)" or cursor_before_line:match "^%s*-%s*$" and ""
   if item_text == nil then
     return false, ""
   end
@@ -48,7 +48,7 @@ local function in_frontmatter_tags_list(bufnr, cursor_line, cursor_before_line)
       return key == "tags", item_text
     end
     -- If we hit a line that's not a list item or empty, stop
-    if not l:match "^%s+%-" and not l:match "^%s*$" then
+    if not l:match "^%s*%-" and not l:match "^%s*$" then
       break
     end
   end

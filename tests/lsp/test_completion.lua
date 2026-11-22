@@ -1968,6 +1968,63 @@ tags:
   eq(true, found)
 end
 
+T["completion"]["lists every tag on an empty frontmatter tags: item, except the note's own"] = function()
+  h.mock_vault_contents(child.Obsidian.dir, {
+    ["test.md"] = "---\ntags:\n  - note\n  - \n---\n",
+    ["tagged.md"] = [==[
+---
+tags:
+  - note
+  - todo
+---
+#project
+]==],
+  })
+
+  child.cmd("edit " .. tostring(child.Obsidian.dir / "test.md"))
+  child.api.nvim_win_set_cursor(0, { 4, 4 })
+
+  local result = run_completion(3, 4)
+  local texts = {}
+  for _, item in ipairs(result.items or {}) do
+    texts[#texts + 1] = item.textEdit.newText
+  end
+  table.sort(texts)
+  eq({ "project", "todo" }, texts)
+end
+
+T["completion"]["does not offer the tag being typed"] = function()
+  h.mock_vault_contents(child.Obsidian.dir, {
+    ["test.md"] = "---\ntags:\n  - ta\n---\n",
+    ["tagged.md"] = "---\ntags:\n  - task\n---\n",
+  })
+
+  child.cmd("edit " .. tostring(child.Obsidian.dir / "test.md"))
+  child.api.nvim_win_set_cursor(0, { 3, 6 })
+
+  local result = run_completion(2, 6)
+  local texts = {}
+  for _, item in ipairs(result.items or {}) do
+    texts[#texts + 1] = item.textEdit.newText
+  end
+  eq({ "task" }, texts)
+end
+
+T["completion"]["completes a bare unindented - under tags:"] = function()
+  h.mock_vault_contents(child.Obsidian.dir, {
+    ["test.md"] = "---\ntags:\n-\n---\n",
+    ["tagged.md"] = "---\ntags:\n  - task\n---\n",
+  })
+
+  child.cmd("edit " .. tostring(child.Obsidian.dir / "test.md"))
+  child.api.nvim_win_set_cursor(0, { 3, 1 })
+
+  local result = run_completion(2, 1)
+  eq(1, #result.items)
+  accept_completion(result.items[1])
+  eq("- task", child.api.nvim_buf_get_lines(0, 2, 3, false)[1])
+end
+
 T["completion"]["returns items for unicode tag trigger in body"] = function()
   h.mock_vault_contents(child.Obsidian.dir, {
     ["test.md"] = "#snö",
