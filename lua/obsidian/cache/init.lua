@@ -285,7 +285,15 @@ end
 
 ---Walk vault, populate cache for all supported notes and attachments. Skips entries whose mtime/size match.
 ---@param force boolean? rebuild every entry regardless of stat
-local function initial_scan(force)
+---Milliseconds of indexing between yields to the editor during the initial scan
+local SCAN_SLICE_MS = 15
+
+---Index the vault's new and changed files and drop deleted ones.
+---With `on_done`, runs in slices that yield to the editor (the first index of a large vault
+---parses every note and took seconds), then calls it; without, runs to completion.
+---@param force boolean|?
+---@param on_done fun()|?
+local function initial_scan(force, on_done)
   if not state then
     return
   end
@@ -299,25 +307,54 @@ local function initial_scan(force)
     return not is_internal(path) and not is_ignored(path)
   end, { type = "file", path = scan_state.vault, limit = math.huge })
 
-  for _, abs in ipairs(files) do
-    if not is_internal(abs) and not is_ignored(abs) then
-      abs = vim.fs.normalize(abs)
-      found[abs] = true
-      local existing = scan_state.backend:get(abs)
-      local stat = vim.uv.fs_stat(abs)
-      if stat and (force or not entry_matches(existing, abs, stat)) then
-        reindex_one(abs)
+  local function finish()
+    for path, _ in pairs(scan_state.backend:all()) do
+      local normalized = vim.fs.normalize(path)
+      if not found[normalized] then
+        scan_state.backend:delete(path)
+        schedule_flush()
       end
     end
   end
 
-  for path, _ in pairs(scan_state.backend:all()) do
-    local normalized = vim.fs.normalize(path)
-    if not found[normalized] then
-      scan_state.backend:delete(path)
-      schedule_flush()
+  local i = 1
+  local function step()
+    if state ~= scan_state then
+      return false
+    end
+    local start = vim.uv.hrtime()
+    while i <= #files do
+      local abs = files[i]
+      i = i + 1
+      if not is_internal(abs) and not is_ignored(abs) then
+        abs = vim.fs.normalize(abs)
+        found[abs] = true
+        local existing = scan_state.backend:get(abs)
+        local stat = vim.uv.fs_stat(abs)
+        if stat and (force or not entry_matches(existing, abs, stat)) then
+          reindex_one(abs)
+        end
+      end
+      if on_done and (vim.uv.hrtime() - start) / 1e6 >= SCAN_SLICE_MS then
+        return true
+      end
+    end
+    finish()
+    return false
+  end
+
+  if not on_done then
+    step()
+    return
+  end
+  local function run()
+    if step() then
+      vim.defer_fn(run, 1)
+    elseif state == scan_state then
+      on_done()
     end
   end
+  run()
 end
 
 local function mark_ready()
@@ -431,8 +468,7 @@ function M.setup(opts)
     if state ~= setup_state then
       return
     end
-    initial_scan()
-    mark_ready()
+    initial_scan(false, mark_ready)
   end)
 
   vim.api.nvim_create_autocmd("VimLeavePre", {
