@@ -33,6 +33,7 @@ local cache = require "obsidian.cache"
 ---@field block_link string|?
 ---@field anchor_link string|?
 ---@field new_text_to_option table<string, obsidian.completion.sources.refs.Options>
+---@field memoize boolean|? whether plain note options may come from `option_memo`
 
 local M = {}
 
@@ -586,6 +587,12 @@ local function strip_links(cc)
   cc.anchor_link = anchor ~= nil and header_parser.normalize_anchor(anchor) or nil
 end
 
+---Plain note-name options (no heading or block) are the same on every request until a note
+---changes, and building their links and docs for every note in the vault was most of a
+---completion request; memoized, reset when the cache changes (see `process_cached_search`).
+---@type { key: string|?, options: table<string, table> }
+local option_memo = { key = nil, options = {} }
+
 ---@param cc obsidian.completion.sources.refs.Context
 ---@param label string|?
 ---@param alt_label string|?
@@ -619,7 +626,22 @@ local function update_completion_options(cc, label, alt_label, matching_anchors,
   for _, option in ipairs(new_options) do
     local final_label, display_label, sort_text, new_text, documentation
     local formatted_anchor = wiki_completion_anchor(option.anchor)
-    if option.label then
+    local memo_key
+    if cc.memoize and option.label and not option.anchor and not option.block then
+      memo_key = table.concat({
+        tostring(note.path),
+        option.label,
+        option.alt_label or "",
+        tostring(note.id),
+        table.concat(note.aliases or {}, "\1"),
+        table.concat(note.tags or {}, "\1"),
+      }, "\0")
+    end
+    local memo = memo_key and option_memo.options[memo_key]
+    if memo then
+      final_label, display_label, sort_text, new_text, documentation =
+        memo.final_label, memo.display_label, memo.sort_text, memo.new_text, memo.documentation
+    elseif option.label then
       new_text = note:format_link { label = option.label, anchor = formatted_anchor, block = option.block }
 
       final_label = option.alt_label or option.label
@@ -677,6 +699,15 @@ local function update_completion_options(cc, label, alt_label, matching_anchors,
       }
     else
       error "should not happen"
+    end
+    if memo_key and not memo then
+      option_memo.options[memo_key] = {
+        final_label = final_label,
+        display_label = display_label,
+        sort_text = sort_text,
+        new_text = new_text,
+        documentation = documentation,
+      }
     end
 
     -- use absolute unless relative
@@ -825,6 +856,115 @@ local function process_search_results(cc, results)
   }
 end
 
+---The vault's notes from the cache (memoized until it changes), and the workspace dir.
+---@param cc obsidian.completion.sources.refs.Context
+---@return obsidian.Note[] notes, obsidian.Path dir
+local function cached_notes(cc)
+  local source_path = vim.api.nvim_buf_get_name(cc.request.bufnr)
+  local dir = api.resolve_workspace_dir(source_path ~= "" and source_path or nil)
+  local workspace = api.find_workspace(dir)
+  local templates_dir = api.templates_dir(workspace)
+
+  -- Same notes and links until the cache changes; relative links also depend on the source note
+  local link = Obsidian.opts.link
+  local key = table.concat({
+    cache.generation(),
+    tostring(dir),
+    tostring(templates_dir),
+    tostring(link.style),
+    tostring(link.format),
+    link.format == "relative" and source_path or "",
+  }, "\0")
+  if option_memo.key ~= key then
+    option_memo.key, option_memo.options, option_memo.notes = key, {}, nil
+  end
+
+  if not option_memo.notes then
+    local rows = cache.notes.all()
+    local paths = {}
+    for path in pairs(rows) do
+      if
+        fs_util.is_subpath(path, tostring(dir))
+        and (not templates_dir or not fs_util.is_subpath(path, tostring(templates_dir)))
+      then
+        paths[#paths + 1] = path
+      end
+    end
+    table.sort(paths)
+
+    local Note = require "obsidian.note"
+    ---@type obsidian.Note[]
+    local notes = {}
+    for _, path in ipairs(paths) do
+      notes[#notes + 1] = Note.from_cache(path, rows[path])
+    end
+    option_memo.notes = notes
+  end
+  return option_memo.notes, dir
+end
+
+---Heading anchors of a cached note, built from the cache's headings the way
+---`Note.from_lines` builds them: '#header' for each, and '#parent#header' for nested ones.
+---@param row obsidian.cache.NoteRow
+---@return table<string, obsidian.note.HeaderAnchor>
+local function cached_anchor_links(row)
+  local anchor_links = {}
+  local stack = {} ---@type obsidian.note.HeaderAnchor[]
+  for _, heading in ipairs(row.headings or {}) do
+    while #stack > 0 and stack[#stack].level >= heading.level do
+      stack[#stack] = nil
+    end
+    local parent = stack[#stack]
+    local data =
+      { anchor = heading.anchor, header = heading.header, level = heading.level, line = heading.line, parent = parent }
+    anchor_links[data.anchor] = data
+    if parent then
+      local nested = data.anchor
+      local p = parent
+      while p do
+        nested = p.anchor .. nested
+        p = p.parent
+      end
+      anchor_links[nested] = vim.tbl_extend("force", data, { anchor = nested })
+    end
+    stack[#stack + 1] = data
+  end
+  return anchor_links
+end
+
+---`[[Note#heading` from the cache: the notes whose name, id or an alias contains the typed
+---name (as Obsidian, not ones that only mention it), with their cached headings, instead of
+---reading every note whose text contains the name.
+---@param cc obsidian.completion.sources.refs.Context
+---@return boolean handled
+local function process_cached_anchor_search(cc)
+  if not cache.is_enabled() or not cache.is_ready() or not cc.anchor_link or cc.block_link or cc.search == "" then
+    return false
+  end
+  local all, dir = cached_notes(cc)
+  local term = cc.search:lower()
+  local rows = cache.notes.all()
+  local Note = require "obsidian.note"
+  local matches = {}
+  for _, cached in ipairs(all) do
+    local names = { cached.path.stem, tostring(cached.id) }
+    vim.list_extend(names, cached.aliases or {})
+    for _, name in ipairs(names) do
+      if name and name:lower():find(term, 1, true) then
+        local row = rows[tostring(cached.path)]
+        if row then
+          local note = Note.from_cache(tostring(cached.path), row)
+          note.anchor_links = cached_anchor_links(row)
+          matches[#matches + 1] = note
+        end
+        break
+      end
+    end
+  end
+  process_search_results(cc, include_loaded_notes(matches, dir, { collect_anchor_links = true }, false))
+  return true
+end
+
 ---Use cached metadata to return the complete ordinary note-reference candidate set.
 ---Completion clients can then apply their own fuzzy matcher without a filesystem search.
 ---@param cc obsidian.completion.sources.refs.Context
@@ -833,32 +973,9 @@ local function process_cached_search(cc)
   if not cache.is_enabled() or not cache.is_ready() or cc.anchor_link ~= nil or cc.block_link ~= nil then
     return false
   end
-
-  local source_path = vim.api.nvim_buf_get_name(cc.request.bufnr)
-  local dir = api.resolve_workspace_dir(source_path ~= "" and source_path or nil)
-  local workspace = api.find_workspace(dir)
-  local templates_dir = api.templates_dir(workspace)
-  local rows = cache.notes.all()
-  local paths = {}
-
-  for path in pairs(rows) do
-    if
-      fs_util.is_subpath(path, tostring(dir))
-      and (not templates_dir or not fs_util.is_subpath(path, tostring(templates_dir)))
-    then
-      paths[#paths + 1] = path
-    end
-  end
-  table.sort(paths)
-
-  local Note = require "obsidian.note"
-  ---@type obsidian.Note[]
-  local notes = {}
-  for _, path in ipairs(paths) do
-    notes[#notes + 1] = Note.from_cache(path, rows[path])
-  end
-
-  process_search_results(cc, include_loaded_notes(notes, dir, {}, true))
+  local notes, dir = cached_notes(cc)
+  cc.memoize = true
+  process_search_results(cc, include_loaded_notes({ unpack(notes) }, dir, {}, true))
   return true
 end
 
@@ -899,7 +1016,7 @@ function M.process_completion(completion_resolve_callback, request)
     })
     process_search_results(cc, { note })
   else
-    if process_cached_search(cc) then
+    if process_cached_search(cc) or process_cached_anchor_search(cc) then
       return
     end
 

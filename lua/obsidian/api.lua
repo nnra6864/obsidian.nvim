@@ -170,17 +170,58 @@ M.format_link = function(opts)
   end
 end
 
+---Memoized: completion formats a link (and so looks up its workspace) for every note in the
+---vault, and resolving and normalizing the same paths again dominated its time. Reset whenever
+---the list of workspaces or any of their roots changes. Only absolute paths are memoized
+---(a relative one depends on the working directory).
+local workspace_memo = { workspaces = nil, roots = {}, root_objs = {}, by_path = {} }
+
+---@return string[] roots normalized, without a trailing slash, in the order of Obsidian.workspaces
+local function workspace_roots()
+  local workspaces = Obsidian.workspaces or {}
+  local memo = workspace_memo
+  local stale = memo.workspaces ~= workspaces or #memo.roots ~= #workspaces
+  if not stale then
+    for i, ws in ipairs(workspaces) do
+      if memo.root_objs[i] ~= ws.root then
+        stale = true
+        break
+      end
+    end
+  end
+  if stale then
+    memo.workspaces, memo.roots, memo.root_objs, memo.by_path = workspaces, {}, {}, {}
+    for i, ws in ipairs(workspaces) do
+      memo.root_objs[i] = ws.root
+      memo.roots[i] = (vim.fs.normalize(tostring(ws.root)):gsub("/+$", ""))
+    end
+  end
+  return memo.roots
+end
+
 ---Find the most specific workspace containing a path.
 ---@param path string|obsidian.Path
 ---@return obsidian.Workspace|?
 M.find_workspace = function(path)
-  local normalized = vim.fs.normalize(tostring(Path.new(path):resolve()))
-  local match
-  for _, ws in ipairs(Obsidian.workspaces or {}) do
-    local root = vim.fs.normalize(tostring(ws.root))
-    if fs_util.is_subpath(normalized, root) and (not match or #root > #tostring(match.root)) then
-      match = ws
+  local roots = workspace_roots()
+  local key = tostring(path)
+  local memoize = vim.startswith(key, "/")
+  if memoize then
+    local cached = workspace_memo.by_path[key]
+    if cached ~= nil then
+      return cached or nil
     end
+  end
+  local normalized = vim.fs.normalize(tostring(Path.new(path):resolve())):gsub("/+$", "")
+  local match, match_len
+  for i, ws in ipairs(Obsidian.workspaces or {}) do
+    local root = roots[i]
+    if (normalized == root or vim.startswith(normalized, root .. "/")) and (not match or #root > match_len) then
+      match, match_len = ws, #root
+    end
+  end
+  if memoize then
+    workspace_memo.by_path[key] = match or false
   end
   return match
 end
